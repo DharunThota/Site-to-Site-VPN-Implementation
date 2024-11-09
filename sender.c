@@ -1,8 +1,13 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <openssl/hmac.h>   // Include for HMAC
 
 #include "crypto.h"
+
+#define HMAC_KEY "supersecrethmackey"  // Key for HMAC, ideally securely stored
+#define HMAC_KEY_LEN strlen(HMAC_KEY)
+#define HMAC_SIZE 32                   // HMAC-SHA256 output is 32 bytes
 
 // ESP Header Structure
 struct esp_header {
@@ -37,7 +42,7 @@ void send_encrypted_packet(int sock, unsigned char *plaintext, int plaintext_len
     unsigned char ciphertext[BUFFER_SIZE];
     int ciphertext_len = encrypt(plaintext, plaintext_len, key, iv, ciphertext);
 
-    unsigned char esp_packet[sizeof(struct esp_header) + ciphertext_len];
+    unsigned char esp_packet[sizeof(struct esp_header) + ciphertext_len + HMAC_SIZE];
     struct esp_header *esp_hdr = (struct esp_header *)esp_packet;
 
     esp_hdr->spi = htonl(spi);
@@ -45,12 +50,23 @@ void send_encrypted_packet(int sock, unsigned char *plaintext, int plaintext_len
 
     memcpy(esp_hdr->payload, ciphertext, ciphertext_len);
 
-    int packet_len = sizeof(struct esp_header) + ciphertext_len;
+    // Calculate HMAC for (ESP header + encrypted payload)
+    unsigned char *hmac = esp_packet + sizeof(struct esp_header) + ciphertext_len; // HMAC position
+    unsigned int hmac_len;
+    HMAC(EVP_sha256(), HMAC_KEY, HMAC_KEY_LEN, esp_packet, sizeof(struct esp_header) + ciphertext_len, hmac, &hmac_len);
+
+    // Ensure HMAC is the correct length
+    if (hmac_len != HMAC_SIZE) {
+        fprintf(stderr, "HMAC calculation failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    int packet_len = sizeof(struct esp_header) + ciphertext_len + HMAC_SIZE;
     if (send(sock, esp_packet, packet_len, 0) < 0) {
         perror("Send failed");
         exit(EXIT_FAILURE);
     }
-    printf("Encrypted packet with ESP header sent!\n");
+    printf("Encrypted packet with ESP header and HMAC sent!\n");
 
     (*seq_num)++;
 }

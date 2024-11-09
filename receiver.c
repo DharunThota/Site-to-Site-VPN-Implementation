@@ -1,8 +1,13 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <openssl/hmac.h>    // For HMAC
 
 #include "crypto.h"
+
+#define HMAC_KEY "supersecrethmackey"  // Key for HMAC, should be securely stored
+#define HMAC_KEY_LEN strlen(HMAC_KEY)
+#define HMAC_SIZE 32                   // HMAC-SHA256 output is 32 bytes
 
 // ESP Header Structure
 struct esp_header {
@@ -33,13 +38,25 @@ int setup_socket(int port) {
     return sock;
 }
 
+int verify_hmac(unsigned char *packet, int packet_len, unsigned char *expected_hmac) {
+    unsigned char calculated_hmac[HMAC_SIZE];
+    unsigned int hmac_len;
+
+    HMAC(EVP_sha256(), HMAC_KEY, HMAC_KEY_LEN, packet, packet_len, calculated_hmac, &hmac_len);
+
+    if (hmac_len != HMAC_SIZE || memcmp(calculated_hmac, expected_hmac, HMAC_SIZE) != 0) {
+        return 0;  // HMAC does not match
+    }
+    return 1;  // HMAC matches
+}
+
 void receive_and_decrypt_packet(int sock, unsigned char *key, unsigned char *iv, uint32_t expected_spi) {
     unsigned char buffer[BUFFER_SIZE];
     int len;
     unsigned char decryptedtext[BUFFER_SIZE];
 
     len = recv(sock, buffer, BUFFER_SIZE, 0);
-    if (len < sizeof(struct esp_header)) {
+    if (len < sizeof(struct esp_header) + HMAC_SIZE) {
         perror("Received packet too small");
         exit(EXIT_FAILURE);
     }
@@ -54,10 +71,17 @@ void receive_and_decrypt_packet(int sock, unsigned char *key, unsigned char *iv,
     }
     printf("Received packet with SPI: %u, Sequence number: %u\n", spi, seq_num);
 
+    int payload_len = len - sizeof(struct esp_header) - HMAC_SIZE;
     unsigned char *ciphertext = esp_hdr->payload;
-    printf("Ciphertext: %s\n", ciphertext);
-    int ciphertext_len = len - sizeof(struct esp_header);
-    int decryptedtext_len = decrypt(ciphertext, ciphertext_len, key, iv, decryptedtext);
+    unsigned char *received_hmac = buffer + len - HMAC_SIZE;
+
+    if (!verify_hmac(buffer, sizeof(struct esp_header) + payload_len, received_hmac)) {
+        fprintf(stderr, "HMAC verification failed! Packet discarded.\n");
+        return;
+    }
+    printf("HMAC verified successfully.\n");
+
+    int decryptedtext_len = decrypt(ciphertext, payload_len, key, iv, decryptedtext);
     decryptedtext[decryptedtext_len] = '\0';
 
     printf("Decrypted packet: %s\n", decryptedtext);
