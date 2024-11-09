@@ -1,13 +1,14 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
-#include <openssl/hmac.h>    // For HMAC
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
 
 #include "crypto.h"
 
-#define HMAC_KEY "supersecrethmackey"  // Key for HMAC, should be securely stored
-#define HMAC_KEY_LEN strlen(HMAC_KEY)
-#define HMAC_SIZE 32                   // HMAC-SHA256 output is 32 bytes
+#define BUFFER_SIZE 1024
 
 // ESP Header Structure
 struct esp_header {
@@ -16,6 +17,34 @@ struct esp_header {
     unsigned char payload[];  // Placeholder for encrypted payload
 };
 
+// IKE Phase 1: Handle key exchange with a pre-shared key
+int ike_phase1(int sock, const char *psk, struct sockaddr_in *client_addr) {
+    unsigned char buffer[BUFFER_SIZE];
+    socklen_t client_len = sizeof(*client_addr);
+
+    // Receive authentication request
+    int len = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr*)client_addr, &client_len);
+    if (len < 0) {
+        perror("IKE Phase 1: Receive failed");
+        return -1;
+    }
+
+    buffer[len] = '\0';
+    printf("IKE Phase 1: Received request: %s\n", buffer);
+
+    // Send a response with the pre-shared key
+    snprintf((char *)buffer, sizeof(buffer), "IKE Phase 1: Key exchange response with PSK: %s", psk);
+    if (sendto(sock, buffer, strlen((char *)buffer), 0, (struct sockaddr*)client_addr, client_len) < 0) {
+        perror("IKE Phase 1: Send failed");
+        return -1;
+    }
+    printf("IKE Phase 1: Response sent\n");
+
+    printf("IKE Phase 1: Key exchange complete with PSK\n");
+    return 0;
+}
+
+// Set up the UDP socket for receiving packets
 int setup_socket(int port) {
     int sock;
     struct sockaddr_in server_addr;
@@ -38,25 +67,16 @@ int setup_socket(int port) {
     return sock;
 }
 
-int verify_hmac(unsigned char *packet, int packet_len, unsigned char *expected_hmac) {
-    unsigned char calculated_hmac[HMAC_SIZE];
-    unsigned int hmac_len;
-
-    HMAC(EVP_sha256(), HMAC_KEY, HMAC_KEY_LEN, packet, packet_len, calculated_hmac, &hmac_len);
-
-    if (hmac_len != HMAC_SIZE || memcmp(calculated_hmac, expected_hmac, HMAC_SIZE) != 0) {
-        return 0;  // HMAC does not match
-    }
-    return 1;  // HMAC matches
-}
-
+// Receive and decrypt ESP packets
 void receive_and_decrypt_packet(int sock, unsigned char *key, unsigned char *iv, uint32_t expected_spi) {
     unsigned char buffer[BUFFER_SIZE];
     int len;
     unsigned char decryptedtext[BUFFER_SIZE];
+    struct sockaddr_in sender_addr;
+    socklen_t sender_len = sizeof(sender_addr);
 
-    len = recv(sock, buffer, BUFFER_SIZE, 0);
-    if (len < sizeof(struct esp_header) + HMAC_SIZE) {
+    len = recvfrom(sock, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&sender_addr, &sender_len);
+    if (len < sizeof(struct esp_header)) {
         perror("Received packet too small");
         exit(EXIT_FAILURE);
     }
@@ -71,17 +91,11 @@ void receive_and_decrypt_packet(int sock, unsigned char *key, unsigned char *iv,
     }
     printf("Received packet with SPI: %u, Sequence number: %u\n", spi, seq_num);
 
-    int payload_len = len - sizeof(struct esp_header) - HMAC_SIZE;
     unsigned char *ciphertext = esp_hdr->payload;
-    unsigned char *received_hmac = buffer + len - HMAC_SIZE;
+    int ciphertext_len = len - sizeof(struct esp_header);
 
-    if (!verify_hmac(buffer, sizeof(struct esp_header) + payload_len, received_hmac)) {
-        fprintf(stderr, "HMAC verification failed! Packet discarded.\n");
-        return;
-    }
-    printf("HMAC verified successfully.\n");
-
-    int decryptedtext_len = decrypt(ciphertext, payload_len, key, iv, decryptedtext);
+    // Decrypt the payload
+    int decryptedtext_len = decrypt(ciphertext, ciphertext_len, key, iv, decryptedtext);
     decryptedtext[decryptedtext_len] = '\0';
 
     printf("Decrypted packet: %s\n", decryptedtext);
@@ -89,11 +103,22 @@ void receive_and_decrypt_packet(int sock, unsigned char *key, unsigned char *iv,
 
 int main() {
     int port = 12345;
+    const char *psk = "sharedsecret";  // Pre-shared key for IKE Phase 1
     unsigned char *key = (unsigned char *)"01234567890123456789012345678901";
     unsigned char *iv = (unsigned char *)"0123456789012345";
     uint32_t expected_spi = 1001;
 
     int sock = setup_socket(port);
+    struct sockaddr_in client_addr;
+
+    // Perform IKE Phase 1 key exchange
+    if (ike_phase1(sock, psk, &client_addr) != 0) {
+        printf("IKE Phase 1 failed. Exiting.\n");
+        close(sock);
+        return -1;
+    }
+
+    // Receive and decrypt ESP packets
     receive_and_decrypt_packet(sock, key, iv, expected_spi);
 
     close(sock);
