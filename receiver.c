@@ -9,20 +9,19 @@
 #include "crypto.h"
 
 #define BUFFER_SIZE 1024
+#define MAX_SEQ_NUM 1024
 
 // ESP Header Structure
 struct esp_header {
-    uint32_t spi;       // Security Parameters Index
-    uint32_t seq_num;   // Sequence number
-    unsigned char payload[];  // Placeholder for encrypted payload
+    uint32_t spi;
+    uint32_t seq_num;
+    unsigned char payload[];
 };
 
-// IKE Phase 1: Handle key exchange with a pre-shared key
 int ike_phase1(int sock, const char *psk, struct sockaddr_in *client_addr) {
     unsigned char buffer[BUFFER_SIZE];
     socklen_t client_len = sizeof(*client_addr);
 
-    // Receive authentication request
     int len = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr*)client_addr, &client_len);
     if (len < 0) {
         perror("IKE Phase 1: Receive failed");
@@ -32,7 +31,6 @@ int ike_phase1(int sock, const char *psk, struct sockaddr_in *client_addr) {
     buffer[len] = '\0';
     printf("IKE Phase 1: Received request: %s\n", buffer);
 
-    // Send a response with the pre-shared key
     snprintf((char *)buffer, sizeof(buffer), "IKE Phase 1: Key exchange response with PSK: %s", psk);
     if (sendto(sock, buffer, strlen((char *)buffer), 0, (struct sockaddr*)client_addr, client_len) < 0) {
         perror("IKE Phase 1: Send failed");
@@ -44,7 +42,6 @@ int ike_phase1(int sock, const char *psk, struct sockaddr_in *client_addr) {
     return 0;
 }
 
-// Set up the UDP socket for receiving packets
 int setup_socket(int port) {
     int sock;
     struct sockaddr_in server_addr;
@@ -67,15 +64,26 @@ int setup_socket(int port) {
     return sock;
 }
 
-// Receive and decrypt ESP packets
+int check_replay_protection(uint32_t seq_num, uint32_t *received_sequences, int *num_received) {
+    for (int i = 0; i < *num_received; i++) {
+        if (received_sequences[i] == seq_num) {
+            return 1;  // Replay detected
+        }
+    }
+    received_sequences[*num_received] = seq_num;
+    (*num_received)++;
+    return 0;
+}
+
 void receive_and_decrypt_packet(int sock, unsigned char *key, unsigned char *iv, uint32_t expected_spi) {
     unsigned char buffer[BUFFER_SIZE];
-    int len;
     unsigned char decryptedtext[BUFFER_SIZE];
     struct sockaddr_in sender_addr;
     socklen_t sender_len = sizeof(sender_addr);
+    uint32_t received_sequences[MAX_SEQ_NUM];
+    int num_received = 0;
 
-    len = recvfrom(sock, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&sender_addr, &sender_len);
+    int len = recvfrom(sock, buffer, BUFFER_SIZE, 0, (struct sockaddr*)&sender_addr, &sender_len);
     if (len < sizeof(struct esp_header)) {
         perror("Received packet too small");
         exit(EXIT_FAILURE);
@@ -89,21 +97,43 @@ void receive_and_decrypt_packet(int sock, unsigned char *key, unsigned char *iv,
         printf("SPI mismatch: expected %u but got %u\n", expected_spi, spi);
         return;
     }
-    printf("Received packet with SPI: %u, Sequence number: %u\n", spi, seq_num);
+
+    if (check_replay_protection(seq_num, received_sequences, &num_received)) {
+        printf("Replay attack detected for sequence number %u\n", seq_num);
+        return;
+    }
 
     unsigned char *ciphertext = esp_hdr->payload;
     int ciphertext_len = len - sizeof(struct esp_header);
 
-    // Decrypt the payload
     int decryptedtext_len = decrypt(ciphertext, ciphertext_len, key, iv, decryptedtext);
     decryptedtext[decryptedtext_len] = '\0';
 
-    printf("Decrypted packet: %s\n", decryptedtext);
+    printf("Decrypted packet (SPI: %u, Seq Num: %u): %s\n", spi, seq_num, decryptedtext);
+}
+
+int receive_termination_signal(int sock) {
+    unsigned char buffer[BUFFER_SIZE];
+    struct sockaddr_in sender_addr;
+    socklen_t sender_len = sizeof(sender_addr);
+
+    int len = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr*)&sender_addr, &sender_len);
+    if (len < 0) {
+        perror("Error receiving termination signal");
+        return 1;
+    }
+
+    buffer[len] = '\0';
+    if (strcmp((char *)buffer, "Termination Signal: Closing VPN session.") == 0) {
+        printf("Termination signal received. Closing connection...\n");
+        return 1;
+    }
+    return 0;
 }
 
 int main() {
     int port = 12345;
-    const char *psk = "sharedsecret";  // Pre-shared key for IKE Phase 1
+    const char *psk = "sharedsecret";
     unsigned char *key = (unsigned char *)"01234567890123456789012345678901";
     unsigned char *iv = (unsigned char *)"0123456789012345";
     uint32_t expected_spi = 1001;
@@ -111,15 +141,17 @@ int main() {
     int sock = setup_socket(port);
     struct sockaddr_in client_addr;
 
-    // Perform IKE Phase 1 key exchange
     if (ike_phase1(sock, psk, &client_addr) != 0) {
         printf("IKE Phase 1 failed. Exiting.\n");
         close(sock);
         return -1;
     }
 
-    // Receive and decrypt ESP packets
-    receive_and_decrypt_packet(sock, key, iv, expected_spi);
+    while (1) {
+        receive_and_decrypt_packet(sock, key, iv, expected_spi);
+
+        if(receive_termination_signal(sock)) break;
+    }
 
     close(sock);
     return 0;

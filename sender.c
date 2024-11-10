@@ -2,8 +2,14 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "crypto.h"
+
+#define MAX_PACKETS 5
+#define BUFFER_SIZE 1024
 
 // ESP Header Structure
 struct esp_header {
@@ -22,7 +28,6 @@ int ike_phase1(int sock, const char *psk, const char *ip_address, int port) {
     dest_addr.sin_port = htons(port);
     inet_pton(AF_INET, ip_address, &dest_addr.sin_addr);
 
-    // Send authentication request (simulating with a pre-shared key)
     snprintf((char *)buffer, sizeof(buffer), "IKE Phase 1: Initiate key exchange with PSK: %s", psk);
     if (sendto(sock, buffer, strlen((char *)buffer), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr)) < 0) {
         perror("IKE Phase 1: Send failed");
@@ -30,17 +35,13 @@ int ike_phase1(int sock, const char *psk, const char *ip_address, int port) {
     }
     printf("IKE Phase 1: Key exchange initiated with PSK\n");
 
-    // Simulate receiving a response
     int len = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
     if (len < 0) {
         perror("IKE Phase 1: Receive failed");
         return -1;
     }
-
     buffer[len] = '\0';
     printf("IKE Phase 1: Response received: %s\n", buffer);
-
-    // Simulate key exchange success
     printf("IKE Phase 1: Key exchange complete with PSK\n");
     return 0;
 }
@@ -85,9 +86,23 @@ void send_encrypted_packet(int sock, unsigned char *plaintext, int plaintext_len
         perror("Send failed");
         exit(EXIT_FAILURE);
     }
-    printf("Encrypted packet with ESP header sent!\n");
+    printf("Encrypted packet with ESP header sent (SPI: %u, Seq Num: %u)\n", spi, *seq_num);
 
     (*seq_num)++;
+}
+
+void send_termination_signal(int sock, const char *ip_address, int port) {
+    unsigned char termination_msg[] = "Termination Signal: Closing VPN session.";
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip_address, &dest_addr.sin_addr);
+
+    if (sendto(sock, termination_msg, strlen((char *)termination_msg), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr)) < 0) {
+        perror("Termination signal send failed");
+    } else {
+        printf("Termination signal sent!\n");
+    }
 }
 
 int main() {
@@ -101,7 +116,6 @@ int main() {
 
     int sock = setup_socket(ip_address, port);
 
-    // Perform IKE Phase 1 key exchange
     if (ike_phase1(sock, psk, ip_address, port) != 0) {
         printf("IKE Phase 1 failed. Exiting.\n");
         close(sock);
@@ -111,7 +125,11 @@ int main() {
     unsigned char *plaintext = (unsigned char *)"This is a test message from the IPsec-like VPN PoC!";
     int plaintext_len = strlen((char *)plaintext);
 
-    send_encrypted_packet(sock, plaintext, plaintext_len, key, iv, spi, &seq_num, ip_address, port);
+    for (int i = 0; i < MAX_PACKETS; i++) {
+        send_encrypted_packet(sock, plaintext, plaintext_len, key, iv, spi, &seq_num, ip_address, port);
+    }
+
+    send_termination_signal(sock, ip_address, port);
 
     close(sock);
     return 0;
